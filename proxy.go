@@ -30,6 +30,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 )
 
 const (
@@ -51,6 +52,33 @@ type WebsocketProxy struct {
 	logger      *log.Logger
 	// Send handshake before callback
 	beforeHandshake func(r *http.Request) error
+	// whether proxied packets should be dropped
+	drop atomic.Bool
+}
+
+type dropReader struct {
+	conn net.Conn
+	drop *atomic.Bool
+}
+
+func (r *dropReader) Read(p []byte) (int, error) {
+	n, err := r.conn.Read(p)
+	if r.drop.Load() {
+		return n, nil
+	}
+	return n, err
+}
+
+type dropWriter struct {
+	conn net.Conn
+	drop *atomic.Bool
+}
+
+func (w *dropWriter) Write(p []byte) (int, error) {
+	if w.drop.Load() {
+		return len(p), nil
+	}
+	return w.conn.Write(p)
 }
 
 type Options func(wp *WebsocketProxy)
@@ -136,7 +164,9 @@ func (wp *WebsocketProxy) Proxy(writer http.ResponseWriter, request *http.Reques
 	copyConn := func(a, b net.Conn) {
 		buf := ByteSliceGet(BufSize)
 		defer ByteSlicePut(buf)
-		_, err := io.CopyBuffer(a, b, buf)
+		reader := &dropReader{conn: b, drop: &wp.drop}
+		writer := &dropWriter{conn: a, drop: &wp.drop}
+		_, err := io.CopyBuffer(writer, reader, buf)
 		errChan <- err
 	}
 	go copyConn(conn, remoteConn) // response
@@ -147,6 +177,10 @@ func (wp *WebsocketProxy) Proxy(writer http.ResponseWriter, request *http.Reques
 			log.Println(err)
 		}
 	}
+}
+
+func (wp *WebsocketProxy) Drop(state bool) {
+	wp.drop.Store(state)
 }
 
 func SetTLSConfig(tlsc *tls.Config) Options {
